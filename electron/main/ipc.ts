@@ -301,18 +301,57 @@ export function setupInstanceIPC(mainWindow: BrowserWindow) {
       sendLog(`Zip download path: ${zipPath}`)
       sendLog(`Target binary path: ${targetPath}`)
 
-      // Download the zip file
-      sendLog("Starting download...")
-      await downloadFile(
-        downloadUrl, 
-        zipPath, 
-        (progress) => {
-          mainWindow.webContents.send("opencode:download-progress", progress)
-        },
-        sendLog
-      )
+      // Download the zip file using curl
+      sendLog("Starting download using curl...")
+      sendLog(`Running: curl -o "${zipPath}" -L "${downloadUrl}"`)
+      
+      await new Promise<void>((resolve, reject) => {
+        const child = spawn("curl", ["-o", zipPath, "-L", downloadUrl], {
+          stdio: ["ignore", "pipe", "pipe"],
+          cwd: binariesDir
+        })
 
-      sendLog("Download completed successfully")
+        let stdout = ""
+        let stderr = ""
+
+        child.stdout?.on("data", (data) => {
+          const output = data.toString()
+          stdout += output
+          if (output.trim()) {
+            sendLog(output.trim())
+          }
+        })
+
+        child.stderr?.on("data", (data) => {
+          const output = data.toString()
+          stderr += output
+          // curl outputs progress to stderr, so log it
+          if (output.trim()) {
+            sendLog(output.trim())
+          }
+        })
+
+        child.on("error", (error) => {
+          sendLog(`Curl process error: ${error.message}`)
+          reject(error)
+        })
+
+        child.on("close", (code) => {
+          if (code === 0) {
+            sendLog("Download completed successfully")
+            resolve()
+          } else {
+            sendLog(`Curl exited with code ${code}`)
+            reject(new Error(`Curl failed with exit code ${code}\nStdout: ${stdout}\nStderr: ${stderr}`))
+          }
+        })
+      })
+
+      // Verify zip file exists
+      if (!fs.existsSync(zipPath)) {
+        throw new Error("Downloaded zip file not found")
+      }
+      sendLog(`Zip file size: ${(fs.statSync(zipPath).size / 1024 / 1024).toFixed(2)} MB`)
 
       // Extract the zip file
       sendLog("Extracting zip file...")
@@ -320,9 +359,15 @@ export function setupInstanceIPC(mainWindow: BrowserWindow) {
       zip.extractAllTo(binariesDir, true)
       sendLog("Extraction completed")
 
+      // Verify binary exists
+      if (!fs.existsSync(targetPath)) {
+        throw new Error(`Binary not found after extraction: ${targetPath}`)
+      }
+
       // Clean up zip file
       sendLog("Cleaning up zip file...")
       fs.unlinkSync(zipPath)
+      sendLog("Zip file deleted")
 
       // Make executable on Unix-like systems
       if (platform !== "win32") {

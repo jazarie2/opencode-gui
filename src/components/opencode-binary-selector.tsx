@@ -1,5 +1,5 @@
 import { Component, For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js"
-import { FolderOpen, Trash2, Check, AlertCircle, Loader2, Plus } from "lucide-solid"
+import { FolderOpen, Trash2, Check, AlertCircle, Loader2, Plus, Download } from "lucide-solid"
 import { useConfig } from "../stores/preferences"
 
 interface BinaryOption {
@@ -29,6 +29,9 @@ const OpenCodeBinarySelector: Component<OpenCodeBinarySelectorProps> = (props) =
   const [validationError, setValidationError] = createSignal<string | null>(null)
   const [versionInfo, setVersionInfo] = createSignal<Map<string, string>>(new Map<string, string>())
   const [validatingPaths, setValidatingPaths] = createSignal<Set<string>>(new Set<string>())
+  const [downloading, setDownloading] = createSignal(false)
+  const [downloadProgress, setDownloadProgress] = createSignal(0)
+  const [downloadLogs, setDownloadLogs] = createSignal<string[]>([])
 
   const binaries = () => opencodeBinaries()
   const lastUsedBinary = () => preferences().lastUsedBinary
@@ -85,6 +88,22 @@ const OpenCodeBinarySelector: Component<OpenCodeBinarySelectorProps> = (props) =
   onCleanup(() => {
     setValidatingPaths(new Set<string>())
     setValidating(false)
+  })
+
+  // Set up download progress listener
+  createEffect(() => {
+    const cleanupProgress = window.electronAPI.onDownloadProgress((progress) => {
+      setDownloadProgress(progress)
+    })
+    
+    const cleanupLog = window.electronAPI.onDownloadLog((message) => {
+      setDownloadLogs((logs) => [...logs, message])
+    })
+    
+    onCleanup(() => {
+      cleanupProgress()
+      cleanupLog()
+    })
   })
 
   async function validateBinary(path: string): Promise<{ valid: boolean; version?: string; error?: string }> {
@@ -175,6 +194,39 @@ const OpenCodeBinarySelector: Component<OpenCodeBinarySelectorProps> = (props) =
     }
   }
 
+  async function handleDownloadOpenCode() {
+    if (props.disabled || downloading()) return
+    
+    try {
+      setDownloading(true)
+      setDownloadProgress(0)
+      setDownloadLogs([])
+      setValidationError(null)
+
+      const result = await window.electronAPI.downloadOpenCode()
+
+      if (result.success && result.path) {
+        // Validate and add the downloaded binary
+        const validation = await validateBinary(result.path)
+        
+        if (validation.valid) {
+          addOpenCodeBinary(result.path, validation.version)
+          props.onBinaryChange(result.path)
+          updatePreferences({ lastUsedBinary: result.path })
+        } else {
+          setValidationError(validation.error || "Downloaded binary is invalid")
+        }
+      } else {
+        setValidationError(result.error || "Download failed")
+      }
+    } catch (error) {
+      setValidationError(error instanceof Error ? error.message : "Download failed")
+    } finally {
+      setDownloading(false)
+      setDownloadProgress(0)
+    }
+  }
+
   function formatRelativeTime(timestamp?: number): string {
     if (!timestamp) return ""
     const seconds = Math.floor((Date.now() - timestamp) / 1000)
@@ -248,11 +300,40 @@ const OpenCodeBinarySelector: Component<OpenCodeBinarySelectorProps> = (props) =
           Browse for Binary…
         </button>
 
+        <button
+          type="button"
+          onClick={handleDownloadOpenCode}
+          disabled={props.disabled || downloading()}
+          class="selector-button selector-button-primary w-full flex items-center justify-center gap-2"
+        >
+          <Show when={downloading()} fallback={<Download class="w-4 h-4" />}>
+            <Loader2 class="w-4 h-4 animate-spin" />
+          </Show>
+          <Show when={downloading()} fallback="Download OpenCode">
+            Downloading… {downloadProgress()}%
+          </Show>
+        </button>
+
         <Show when={validationError()}>
           <div class="selector-validation-error">
             <div class="selector-validation-error-content">
               <AlertCircle class="selector-validation-error-icon" />
               <span class="selector-validation-error-text">{validationError()}</span>
+            </div>
+          </div>
+        </Show>
+
+        <Show when={downloadLogs().length > 0}>
+          <div class="panel-body border border-border rounded-lg p-3 bg-background-secondary">
+            <div class="text-xs font-semibold text-muted mb-2">Download Logs:</div>
+            <div class="space-y-1 max-h-48 overflow-y-auto font-mono text-xs">
+              <For each={downloadLogs()}>
+                {(log) => (
+                  <div class="text-muted whitespace-pre-wrap break-all">
+                    {log}
+                  </div>
+                )}
+              </For>
             </div>
           </div>
         </Show>
