@@ -23,6 +23,9 @@ export interface ElectronAPI {
   // OpenCode binary operations
   selectOpenCodeBinary: () => Promise<string | null>
   validateOpenCodeBinary: (path: string) => Promise<{ valid: boolean; version?: string; error?: string }>
+  downloadOpenCode: () => Promise<{ success: boolean; path?: string; error?: string }>
+  onDownloadProgress: (callback: (progress: number) => void) => () => void
+  onDownloadLog: (callback: (message: string) => void) => () => void
   // Storage operations
   getConfigPath: () => Promise<string>
   getInstancesDir: () => Promise<string>
@@ -58,6 +61,15 @@ const electronAPI: ElectronAPI = {
   // OpenCode binary operations
   selectOpenCodeBinary: () => ipcRenderer.invoke("dialog:selectOpenCodeBinary"),
   validateOpenCodeBinary: (path: string) => ipcRenderer.invoke("opencode:validateBinary", path),
+  downloadOpenCode: () => ipcRenderer.invoke("opencode:download"),
+  onDownloadProgress: (callback: (progress: number) => void) => {
+    ipcRenderer.on("opencode:download-progress", (_, progress) => callback(progress))
+    return () => ipcRenderer.removeAllListeners("opencode:download-progress")
+  },
+  onDownloadLog: (callback: (message: string) => void) => {
+    ipcRenderer.on("opencode:download-log", (_, message) => callback(message))
+    return () => ipcRenderer.removeAllListeners("opencode:download-log")
+  },
   // Storage operations
   getConfigPath: () => ipcRenderer.invoke("storage:getConfigPath"),
   getInstancesDir: () => ipcRenderer.invoke("storage:getInstancesDir"),

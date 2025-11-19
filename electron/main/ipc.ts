@@ -1,10 +1,14 @@
-import { ipcMain, BrowserWindow, dialog } from "electron"
+import { ipcMain, BrowserWindow, dialog, app } from "electron"
 import { processManager } from "./process-manager"
 import { randomBytes } from "crypto"
 import * as fs from "fs"
 import * as path from "path"
 import { spawn } from "child_process"
 import ignore from "ignore"
+import * as https from "https"
+import * as http from "http"
+import { URL } from "url"
+import AdmZip from "adm-zip"
 
 interface Instance {
   id: string
@@ -239,5 +243,245 @@ export function setupInstanceIPC(mainWindow: BrowserWindow) {
         error: error instanceof Error ? error.message : String(error),
       }
     }
+  })
+
+  // Download OpenCode binary
+  ipcMain.handle("opencode:download", async (event) => {
+    const platform = process.platform
+    const arch = process.arch
+
+    const sendLog = (message: string) => {
+      console.log(`[OpenCode Download] ${message}`)
+      mainWindow.webContents.send("opencode:download-log", message)
+    }
+
+    try {
+      sendLog(`Starting download for platform: ${platform}, arch: ${arch}`)
+
+      // Determine download URL based on platform and architecture
+      const baseUrl = "https://github.com/sst/opencode/releases/download/v1.0.78"
+      let filename: string
+      let binaryName: string
+
+      if (platform === "win32") {
+        filename = arch === "arm64" ? "opencode-windows-arm64.zip" : "opencode-windows-x64.zip"
+        binaryName = "opencode.exe"
+      } else if (platform === "darwin") {
+        filename = arch === "arm64" ? "opencode-macos-arm64.zip" : "opencode-macos-x64.zip"
+        binaryName = "opencode"
+      } else {
+        // Linux
+        filename = arch === "arm64" ? "opencode-linux-arm64.zip" : "opencode-linux-x64.zip"
+        binaryName = "opencode"
+      }
+
+      const downloadUrl = `${baseUrl}/${filename}`
+      sendLog(`Download URL: ${downloadUrl}`)
+
+      // Check for proxy settings
+      const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.https_proxy || process.env.http_proxy
+      if (proxyUrl) {
+        sendLog(`Using proxy: ${proxyUrl}`)
+      } else {
+        sendLog("No proxy configured")
+      }
+
+      // Create binaries directory in app data
+      const configDir = path.join(app.getPath("home"), ".config", "codenomad")
+      const binariesDir = path.join(configDir, "binaries")
+      sendLog(`Target directory: ${binariesDir}`)
+      
+      if (!fs.existsSync(binariesDir)) {
+        sendLog("Creating binaries directory...")
+        fs.mkdirSync(binariesDir, { recursive: true })
+      }
+
+      const zipPath = path.join(binariesDir, filename)
+      const targetPath = path.join(binariesDir, binaryName)
+      sendLog(`Zip download path: ${zipPath}`)
+      sendLog(`Target binary path: ${targetPath}`)
+
+      // Download the zip file
+      sendLog("Starting download...")
+      await downloadFile(
+        downloadUrl, 
+        zipPath, 
+        (progress) => {
+          mainWindow.webContents.send("opencode:download-progress", progress)
+        },
+        sendLog
+      )
+
+      sendLog("Download completed successfully")
+
+      // Extract the zip file
+      sendLog("Extracting zip file...")
+      const zip = new AdmZip(zipPath)
+      zip.extractAllTo(binariesDir, true)
+      sendLog("Extraction completed")
+
+      // Clean up zip file
+      sendLog("Cleaning up zip file...")
+      fs.unlinkSync(zipPath)
+
+      // Make executable on Unix-like systems
+      if (platform !== "win32") {
+        sendLog("Setting executable permissions...")
+        fs.chmodSync(targetPath, 0o755)
+      }
+
+      sendLog(`Binary installed at: ${targetPath}`)
+      return { success: true, path: targetPath }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      sendLog(`Download failed: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
+    }
+  })
+}
+
+function downloadFile(
+  url: string, 
+  targetPath: string, 
+  onProgress: (progress: number) => void,
+  onLog: (message: string) => void,
+  redirectCount = 0
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (redirectCount > 5) {
+      reject(new Error("Too many redirects"))
+      return
+    }
+
+    onLog(`Fetching: ${url} (redirect count: ${redirectCount})`)
+    
+    const parsedUrl = new URL(url)
+    const protocol = parsedUrl.protocol === "https:" ? https : http
+    
+    onLog(`Protocol: ${parsedUrl.protocol}`)
+    onLog(`Host: ${parsedUrl.host}`)
+    onLog(`Path: ${parsedUrl.pathname}`)
+
+    // Check for proxy settings
+    const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.https_proxy || process.env.http_proxy
+    
+    if (proxyUrl) {
+      onLog(`Proxy detected: ${proxyUrl}`)
+      onLog(`Note: Direct proxy support is not yet implemented. If download fails, try:`)
+      onLog(`1. Temporarily disable proxy`)
+      onLog(`2. Download manually from GitHub releases`)
+      onLog(`3. Configure system to allow direct GitHub access`)
+    }
+
+    const options: https.RequestOptions = {
+      timeout: 60000, // 60 second timeout
+      headers: {
+        "User-Agent": "CodeNomad/1.0",
+      },
+    }
+
+    const request = protocol.get(url, options, (response) => {
+      onLog(`Response status: ${response.statusCode}`)
+      
+      // Log important headers
+      if (response.headers["content-length"]) {
+        onLog(`Content-Length: ${response.headers["content-length"]}`)
+      }
+      if (response.headers["content-type"]) {
+        onLog(`Content-Type: ${response.headers["content-type"]}`)
+      }
+
+      // Handle redirects
+      if (response.statusCode === 301 || response.statusCode === 302 || response.statusCode === 303 || response.statusCode === 307 || response.statusCode === 308) {
+        const redirectUrl = response.headers.location
+        if (!redirectUrl) {
+          reject(new Error("Redirect location not found"))
+          return
+        }
+        onLog(`Redirecting to: ${redirectUrl}`)
+        // Resolve relative URLs
+        const absoluteRedirectUrl = redirectUrl.startsWith("http") ? redirectUrl : new URL(redirectUrl, url).toString()
+        downloadFile(absoluteRedirectUrl, targetPath, onProgress, onLog, redirectCount + 1).then(resolve).catch(reject)
+        return
+      }
+
+      if (response.statusCode !== 200) {
+        reject(new Error(`Failed to download: HTTP ${response.statusCode} ${response.statusMessage}`))
+        return
+      }
+
+      const totalBytes = parseInt(response.headers["content-length"] || "0", 10)
+      onLog(`Content length: ${totalBytes} bytes (${(totalBytes / 1024 / 1024).toFixed(2)} MB)`)
+      
+      let downloadedBytes = 0
+      let lastLoggedProgress = 0
+
+      const fileStream = fs.createWriteStream(targetPath)
+
+      response.on("data", (chunk) => {
+        downloadedBytes += chunk.length
+        if (totalBytes > 0) {
+          const progress = Math.round((downloadedBytes / totalBytes) * 100)
+          onProgress(progress)
+          
+          // Log progress every 10%
+          if (progress >= lastLoggedProgress + 10) {
+            onLog(`Downloaded: ${progress}% (${(downloadedBytes / 1024 / 1024).toFixed(2)} MB)`)
+            lastLoggedProgress = progress
+          }
+        }
+      })
+
+      response.pipe(fileStream)
+
+      fileStream.on("finish", () => {
+        fileStream.close()
+        onProgress(100)
+        onLog("File download completed")
+        resolve()
+      })
+
+      fileStream.on("error", (error) => {
+        fs.unlink(targetPath, () => {}) // Clean up partial download
+        onLog(`File stream error: ${error.message}`)
+        reject(error)
+      })
+
+      response.on("error", (error) => {
+        fs.unlink(targetPath, () => {}) // Clean up partial download
+        onLog(`Response error: ${error.message}`)
+        reject(error)
+      })
+    })
+
+    request.on("error", (error) => {
+      onLog(`Request error: ${error.message}`)
+      if (error.message.includes("ETIMEDOUT")) {
+        onLog("Connection timed out. This may be due to:")
+        onLog("1. Network connectivity issues")
+        onLog("2. Firewall blocking the connection")
+        onLog("3. Proxy configuration needed")
+        onLog("4. GitHub servers being temporarily unavailable")
+        onLog("")
+        onLog("Please try:")
+        onLog("- Check your internet connection")
+        onLog("- Download manually from: https://github.com/opencodetisan/opencode/releases/latest")
+        onLog("- Contact your network administrator if behind a corporate firewall")
+      } else if (error.message.includes("ENOTFOUND")) {
+        onLog("Could not resolve hostname. Please check your DNS settings or internet connection.")
+      } else if (error.message.includes("ECONNREFUSED")) {
+        onLog("Connection refused. This might be a proxy or firewall issue.")
+      }
+      reject(error)
+    })
+
+    request.on("timeout", () => {
+      request.destroy()
+      onLog("Request timeout after 60 seconds")
+      reject(new Error("Request timeout"))
+    })
   })
 }
